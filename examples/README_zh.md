@@ -49,6 +49,39 @@ llamafactory-cli train examples/train_lora/qwen3_lora_pretrain.yaml
 llamafactory-cli train examples/train_lora/qwen3_lora_sft.yaml
 ```
 
+#### 思维链蒸馏（CoT-Gen / CoT-Cond）
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 llamafactory-cli train examples/train_lora/qwen3_lora_sft_cot_gen.yaml
+CUDA_VISIBLE_DEVICES=0,1 llamafactory-cli train examples/train_lora/qwen3_lora_sft_cot_cond.yaml
+```
+
+这两个配置实现了论文《TabRank: Chain-of-Thought Distillation for Table Re-Rankers》（arXiv:2607.25182）中的两种蒸馏范式。在 **CoT-Gen** 中，教师模型的推理过程位于模型回答中，学生模型会学习生成该推理过程。在 **CoT-Cond** 中，推理过程位于用户提示中并被掩码为 `IGNORE_INDEX`，因此它只作为生成排序结果的上下文条件，不参与损失计算。
+
+这两个配置引用的数据集**并未包含在本仓库中**。运行前请在 `data/dataset_info.json` 中注册你自己的数据，例如：
+
+```json
+{
+  "tabrank_cot_gen": {
+    "file_name": "tabrank_cot_gen.json"
+  },
+  "tabrank_cot_cond": {
+    "file_name": "tabrank_cot_cond.json"
+  }
+}
+```
+
+两个数据集均使用 alpaca 格式：
+
+- **CoT-Gen**：`instruction` 列包含查询和候选表格，`output` 列包含 `<think>推理过程</think>{"ranked_tables": [...]}`。
+- **CoT-Cond**：`instruction` 列包含查询和候选表格，`input` 列包含**不带 `<think>` 标签的纯文本**推理过程，`output` 列仅包含排序结果 JSON。
+
+> [!WARNING]
+> 请勿在 CoT-Cond 的提示词侧推理过程中使用 `<think>` 标签。当模型回答中不含思维链时，`ReasoningTemplate` 会自动向提示词中注入一个空的思考块，而思维链移除逻辑仅作用于模型回答，因此 `input` 中的字面标签会导致出现两个思考块。
+
+> [!NOTE]
+> `enable_thinking` 需要在训练和推理时保持一致，但推理时并没有可以放入 CoT-Cond `input` 列的教师推理过程。论文并未说明推理阶段的推理过程来源，因此这两个配置仅覆盖训练阶段。论文中 CoT-Cond 的输出 token 数（TAT-QA 上约 2,473，而 Naive SFT 为 1,297）表明训练后的模型在推理时仍会输出推理过程，这与其训练阶段的形式化定义存在张力。
+
 #### 多模态指令监督微调
 
 ```bash

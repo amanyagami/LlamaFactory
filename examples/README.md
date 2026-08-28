@@ -49,6 +49,39 @@ llamafactory-cli train examples/train_lora/qwen3_lora_pretrain.yaml
 llamafactory-cli train examples/train_lora/qwen3_lora_sft.yaml
 ```
 
+#### Chain-of-Thought Distillation (CoT-Gen / CoT-Cond)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 llamafactory-cli train examples/train_lora/qwen3_lora_sft_cot_gen.yaml
+CUDA_VISIBLE_DEVICES=0,1 llamafactory-cli train examples/train_lora/qwen3_lora_sft_cot_cond.yaml
+```
+
+The two configs implement the distillation paradigms of "TabRank: Chain-of-Thought Distillation for Table Re-Rankers" (arXiv:2607.25182). In **CoT-Gen**, the teacher reasoning trace lives in the model response, so the student learns to generate it. In **CoT-Cond**, the trace lives in the user prompt and is masked to `IGNORE_INDEX`, so it only conditions the ranking output and receives no loss.
+
+Both configs reference datasets that are **not shipped with this repository**. Register your own data in `data/dataset_info.json` before running them, for example:
+
+```json
+{
+  "tabrank_cot_gen": {
+    "file_name": "tabrank_cot_gen.json"
+  },
+  "tabrank_cot_cond": {
+    "file_name": "tabrank_cot_cond.json"
+  }
+}
+```
+
+Both datasets use the alpaca format:
+
+- **CoT-Gen**: `instruction` holds the query and the candidate tables, `output` holds `<think>trace</think>{"ranked_tables": [...]}`.
+- **CoT-Cond**: `instruction` holds the query and the candidate tables, `input` holds the trace as **plain text without literal `<think>` tags**, and `output` holds the ranking JSON only.
+
+> [!WARNING]
+> Do not wrap the CoT-Cond prompt-side trace in `<think>` tags. `ReasoningTemplate` injects its own empty think block into the prompt whenever the response contains none, and thought removal only runs on assistant messages, so literal tags in `input` would produce a malformed double block.
+
+> [!NOTE]
+> `enable_thinking` must stay consistent between training and inference, but at inference time there is no teacher trace to place in the CoT-Cond `input` column. The paper does not specify an inference-time source for the trace, so these configs cover training only. The paper's own CoT-Cond output-token counts (~2,473 on TAT-QA vs 1,297 for Naive SFT) suggest the trained model still emits reasoning at inference, which sits in tension with the training-time formulation.
+
 #### Multimodal Supervised Fine-Tuning
 
 ```bash
