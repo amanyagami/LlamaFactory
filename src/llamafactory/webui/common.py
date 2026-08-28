@@ -58,7 +58,7 @@ def abort_process(pid: int) -> None:
 
 def get_save_dir(*paths: str) -> os.PathLike:
     r"""Get the path to saved model checkpoints."""
-    if os.path.sep in paths[-1]:
+    if os.path.isabs(paths[-1]):
         logger.warning_rank0("Found complex path, some features may be not available.")
         return paths[-1]
 

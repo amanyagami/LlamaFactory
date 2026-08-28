@@ -167,12 +167,14 @@ def list_checkpoints(model_name: str, finetuning_type: str) -> "gr.Dropdown":
     if model_name:
         save_dir = get_save_dir(model_name, finetuning_type)
         if save_dir and os.path.isdir(save_dir):
-            for checkpoint in os.listdir(save_dir):
-                if os.path.isdir(os.path.join(save_dir, checkpoint)) and any(
-                    os.path.isfile(os.path.join(save_dir, checkpoint, name)) for name in CHECKPOINT_NAMES
-                ):
-                    checkpoints.append(checkpoint)
+            # walk recursively: a checkpoint may either sit directly under save_dir (a finished run)
+            # or be nested one level deeper as `<run_dir>/checkpoint-<step>` (an intermediate save),
+            # both of which should show up in the dropdown
+            for root, _, files in os.walk(save_dir):
+                if any(name in files for name in CHECKPOINT_NAMES):
+                    checkpoints.append(os.path.relpath(root, save_dir))
 
+    checkpoints = sorted(checkpoints)
     if finetuning_type in PEFT_METHODS:
         return gr.Dropdown(value=[], choices=checkpoints, multiselect=True)
     else:
