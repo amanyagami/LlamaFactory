@@ -49,7 +49,16 @@ MAX_SAFE_REDIRECTS = 5
 # connection is then pinned to that exact IP (see _PinDnsResolution below) so that the
 # underlying HTTP client can never resolve the hostname a second time to a different (private)
 # address -- the classic DNS-rebinding TOCTOU. Pinning is implemented as a temporary, process-wide
-# monkeypatch of socket.getaddrinfo, so requests using it are serialized with this lock.
+# monkeypatch of socket.getaddrinfo, so every fetch_safe_url() call must hold this lock while its
+# patch is active, trading fetch concurrency for correctness: this MUST stay a single global lock,
+# not e.g. striped per-hostname, because the patch target (socket.getaddrinfo) is one process-wide
+# attribute -- two concurrent fetches of *different* hosts would each monkeypatch and restore it
+# independently, racing to clobber each other's pin mid-request. A lock-free, fully concurrent
+# version is possible (pin the IP at the urllib3 connection level via a custom `HTTPConnection`
+# subclass overriding `_new_conn`, leaving `.host`/SNI untouched, instead of monkeypatching DNS
+# resolution), but needs care wiring through requests' HTTPAdapter/PoolManager (proxies, TLS
+# verification, HTTP vs HTTPS) to avoid regressing the SSRF guarantee itself; left as a follow-up
+# rather than risking that rewrite unreviewed in a security fix.
 _dns_pin_lock = threading.Lock()
 
 
