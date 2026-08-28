@@ -138,17 +138,31 @@ def is_multimodal(model_name: str) -> bool:
 
 
 def load_dataset_info(dataset_dir: str) -> dict[str, dict[str, Any]]:
-    r"""Load dataset_info.json."""
+    r"""Load dataset_info.json.
+
+    Raises:
+        ValueError: if dataset_info.json exists but contains invalid JSON or invalid dataset entries.
+    """
     if dataset_dir == "ONLINE" or dataset_dir.startswith("REMOTE:"):
         logger.info_rank0(f"dataset_dir is {dataset_dir}, using online dataset.")
         return {}
 
+    dataset_info_path = os.path.join(dataset_dir, DATA_CONFIG)
     try:
-        with open(os.path.join(dataset_dir, DATA_CONFIG), encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as err:
-        logger.warning_rank0(f"Cannot open {os.path.join(dataset_dir, DATA_CONFIG)} due to {str(err)}.")
+        with open(dataset_info_path, encoding="utf-8") as f:
+            dataset_info = json.load(f)
+    except OSError as err:
+        logger.warning_rank0(f"Cannot open {dataset_info_path} due to {str(err)}.")
         return {}
+    except json.JSONDecodeError as err:
+        logger.warning_rank0(f"Cannot open {dataset_info_path} due to {str(err)}.")
+        raise ValueError(f"Failed to parse {DATA_CONFIG}: {err}") from err
+
+    if not isinstance(dataset_info, dict) or not all(isinstance(value, dict) for value in dataset_info.values()):
+        logger.warning_rank0(f"Invalid dataset entries found in {dataset_info_path}.")
+        raise ValueError(f"Invalid dataset entries found in {DATA_CONFIG}, each dataset must be a JSON object.")
+
+    return dataset_info
 
 
 def load_args(config_path: str) -> dict[str, Any] | None:
