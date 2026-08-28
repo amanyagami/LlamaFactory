@@ -16,23 +16,41 @@ import ipaddress
 import json
 import os
 import socket
+import threading
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from ..extras.misc import is_env_enabled
-from ..extras.packages import is_fastapi_available
+from ..extras.packages import is_fastapi_available, is_requests_available
 
 
 if is_fastapi_available():
     from fastapi import HTTPException, status
 
 
+if is_requests_available():
+    import requests
+
+
 if TYPE_CHECKING:
     from pydantic import BaseModel
+    from requests import Response
 
 
 SAFE_MEDIA_PATH = os.environ.get("SAFE_MEDIA_PATH", os.path.join(os.path.dirname(__file__), "safe_media"))
 ALLOW_LOCAL_FILES = is_env_enabled("ALLOW_LOCAL_FILES", "1")
+
+# Maximum number of HTTP redirects to follow when fetching a remote media URL. Every hop's
+# target is re-validated by check_ssrf_url before being followed, so this only bounds how many
+# times we are willing to re-validate before giving up.
+MAX_SAFE_REDIRECTS = 5
+
+# check_ssrf_url() resolves a hostname to a single, validated IP address, and the actual HTTP
+# connection is then pinned to that exact IP (see _PinDnsResolution below) so that the
+# underlying HTTP client can never resolve the hostname a second time to a different (private)
+# address -- the classic DNS-rebinding TOCTOU. Pinning is implemented as a temporary, process-wide
+# monkeypatch of socket.getaddrinfo, so requests using it are serialized with this lock.
+_dns_pin_lock = threading.Lock()
 
 
 def dictify(data: "BaseModel") -> dict[str, Any]:
@@ -67,30 +85,116 @@ def check_lfi_path(path: str) -> None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or inaccessible file path.")
 
 
-def check_ssrf_url(url: str) -> None:
-    """Checks if a given URL is vulnerable to SSRF. Raises HTTPException if unsafe."""
+def check_ssrf_url(url: str) -> str:
+    """Checks if a given URL is vulnerable to SSRF. Raises HTTPException if unsafe.
+
+    Returns:
+        The IP address that the URL's hostname resolved to. Callers that go on to fetch the URL
+        MUST connect to this exact IP address (e.g. via `_PinDnsResolution`) instead of letting
+        the HTTP client resolve the hostname again, otherwise a second DNS lookup could return a
+        different, private address (DNS rebinding) and bypass this check entirely.
+    """
     try:
         parsed_url = urlparse(url)
-        if parsed_url.scheme not in ["http", "https"]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only HTTP/HTTPS URLs are allowed.")
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid URL: {e}")
 
-        hostname = parsed_url.hostname
-        if not hostname:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid URL hostname.")
+    if parsed_url.scheme not in ["http", "https"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only HTTP/HTTPS URLs are allowed.")
 
+    hostname = parsed_url.hostname
+    if not hostname:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid URL hostname.")
+
+    try:
         ip_info = socket.getaddrinfo(hostname, parsed_url.port)
-        ip_address_str = ip_info[0][4][0]
-        ip = ipaddress.ip_address(ip_address_str)
+    except socket.gaierror:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not resolve hostname: {hostname}")
 
+    if not ip_info:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not resolve hostname: {hostname}")
+
+    # Reject the hostname if ANY resolved address is private/reserved, not just the first one, since
+    # a malicious DNS server can return multiple records and the HTTP client is free to pick any.
+    resolved_ip = None
+    for family_info in ip_info:
+        ip_address_str = family_info[4][0]
+        ip = ipaddress.ip_address(ip_address_str)
         if not ip.is_global:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access to private or reserved IP addresses is not allowed.",
             )
 
-    except socket.gaierror:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not resolve hostname: {parsed_url.hostname}"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid URL: {e}")
+        if resolved_ip is None:
+            resolved_ip = ip_address_str
+
+    return resolved_ip
+
+
+class _PinDnsResolution:
+    """Temporarily forces `socket.getaddrinfo(hostname, ...)` to resolve to a single, pre-validated IP.
+
+    This closes the DNS-rebinding TOCTOU window between `check_ssrf_url` validating a hostname and
+    the HTTP client actually connecting to it: while this is active, resolving `hostname` cannot
+    return anything other than the address that was already checked, no matter what a (potentially
+    attacker-controlled) DNS server would answer on a second query. The patch is process-wide, so
+    callers must hold `_dns_pin_lock` while it is in effect.
+    """
+
+    def __init__(self, hostname: str, ip: str) -> None:
+        self._hostname = hostname
+        self._ip = ip
+        self._original_getaddrinfo = None
+
+    def __enter__(self) -> "_PinDnsResolution":
+        self._original_getaddrinfo = socket.getaddrinfo
+
+        def _pinned_getaddrinfo(host, *args, **kwargs):
+            if host == self._hostname:
+                host = self._ip
+
+            return self._original_getaddrinfo(host, *args, **kwargs)
+
+        socket.getaddrinfo = _pinned_getaddrinfo
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        socket.getaddrinfo = self._original_getaddrinfo
+
+
+def fetch_safe_url(url: str, **kwargs) -> "Response":
+    """Safely fetches a remote URL, guarding against SSRF via HTTP redirects and DNS rebinding.
+
+    The hostname of `url`, and of every redirect hop encountered while following it, is validated
+    with `check_ssrf_url` and the connection is pinned to the exact IP address that was just
+    validated (see `_PinDnsResolution`). Redirects are therefore never auto-followed by the
+    underlying HTTP client: each `Location` is re-validated from scratch, up to `MAX_SAFE_REDIRECTS`
+    hops, before it is followed.
+    """
+    kwargs.setdefault("stream", True)
+    kwargs.setdefault("timeout", 10)
+    kwargs["allow_redirects"] = False
+
+    current_url = url
+    for _ in range(MAX_SAFE_REDIRECTS + 1):
+        parsed_url = urlparse(current_url)
+        ip = check_ssrf_url(current_url)
+
+        with _dns_pin_lock, _PinDnsResolution(parsed_url.hostname, ip):
+            response = requests.get(current_url, **kwargs)
+
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location")
+            response.close()
+            if not location:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect response is missing a Location header."
+                )
+
+            current_url = urljoin(current_url, location)
+            continue
+
+        return response
+
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Too many redirects.")
