@@ -18,10 +18,14 @@ import socket
 import threading
 
 import pytest
-import requests
 from fastapi import HTTPException
 
-from llamafactory.api.common import check_ssrf_url, fetch_safe_url
+from llamafactory.api.common import MAX_SAFE_REDIRECTS, check_ssrf_url, fetch_safe_url
+
+
+# A genuinely private address, used as the target an SSRF attempt is trying to reach. Nothing ever
+# connects to it: every test that uses it asserts the fetch is refused before a connection is made.
+PRIVATE_TARGET = "http://10.255.255.1:9/"
 
 
 class _CountingHandler(http.server.BaseHTTPRequestHandler):
@@ -40,11 +44,27 @@ class _CountingHandler(http.server.BaseHTTPRequestHandler):
         pass  # keep test output clean
 
 
-def _start_server(bind_ip: str, handler_cls: type[http.server.BaseHTTPRequestHandler], port: int = 0):
-    server = http.server.HTTPServer((bind_ip, port), handler_cls)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server
+@pytest.fixture
+def start_server():
+    r"""Start throwaway HTTP servers on 127.0.0.1, shut down even if the test fails.
+
+    Everything binds 127.0.0.1: it is the only loopback address configured on macOS' lo0 by
+    default, so a second one such as 127.0.0.2 would fail to bind on the macos-latest jobs.
+    """
+    servers = []
+
+    def _start(handler_cls: type[http.server.BaseHTTPRequestHandler], port: int = 0):
+        server = http.server.HTTPServer(("127.0.0.1", port), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return server
+
+    try:
+        yield _start
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
 
 
 @pytest.fixture
@@ -52,10 +72,9 @@ def pretend_loopback_is_global(monkeypatch):
     r"""Make `ipaddress.ip_address("127.0.0.1").is_global` return True.
 
     All of 127.0.0.0/8 is loopback and therefore never actually global, so real SSRF payloads
-    can't be built against it directly. This fixture lets tests stand a local HTTP server in for
-    what would, in a real attack, be a public IP address the attacker controls (the first hop that
-    `check_ssrf_url` is expected to allow), while 127.0.0.2 is left as a genuinely private/rejected
-    address representing the internal target the attacker is trying to reach.
+    can't be built against it directly. This fixture lets a local HTTP server stand in for what
+    would, in a real attack, be a public IP address the attacker controls -- the first hop that
+    `check_ssrf_url` is expected to allow.
     """
     original_is_global = ipaddress.IPv4Address.is_global
 
@@ -65,6 +84,17 @@ def pretend_loopback_is_global(monkeypatch):
         return original_is_global.fget(self)
 
     monkeypatch.setattr(ipaddress.IPv4Address, "is_global", property(patched_is_global))
+
+
+def _redirect_handler(location: str) -> type[http.server.BaseHTTPRequestHandler]:
+    class RedirectHandler(_CountingHandler):
+        def do_GET(self):  # noqa: N802
+            type(self).hit_count += 1
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.end_headers()
+
+    return RedirectHandler
 
 
 def test_check_ssrf_url_rejects_private_ip():
@@ -79,184 +109,105 @@ def test_check_ssrf_url_rejects_non_http_scheme():
     assert exc_info.value.status_code == 400
 
 
+def test_check_ssrf_url_rejects_out_of_range_port():
+    r"""An unparseable port is a bad request, not an unhandled ValueError (i.e. a 500)."""
+    with pytest.raises(HTTPException) as exc_info:
+        check_ssrf_url("http://example.com:99999/")
+    assert exc_info.value.status_code == 400
+
+
 def test_check_ssrf_url_returns_resolved_ip(pretend_loopback_is_global):
     ip = check_ssrf_url("http://127.0.0.1:1234/")
     assert ip == "127.0.0.1"
 
 
-def test_naive_redirect_follow_is_vulnerable_to_ssrf(pretend_loopback_is_global):
-    r"""Demonstrates the bug in #10646: validating only the first hop is not enough.
+def test_fetch_safe_url_blocks_redirect_to_private_ip(start_server, pretend_loopback_is_global):
+    r"""fetch_safe_url() must re-validate (and refuse to follow) a redirect into a private IP.
 
-    This mirrors the old, vulnerable call pattern (`check_ssrf_url(url)` followed by a plain
-    `requests.get(url, stream=True)`, which follows redirects by default): the first hop passes
-    the check, but nothing stops the HTTP client from then following a redirect straight into a
-    private address.
+    This is the bug in #10646: validating only the first hop is not enough, because the HTTP
+    client will happily follow a redirect straight into a private address afterwards.
     """
-    _CountingHandler.hit_count = 0
-
-    class InternalHandler(_CountingHandler):
-        response_body = b"SECRET_INTERNAL_DATA"
-
-    internal = _start_server("127.0.0.2", InternalHandler)
-    internal_port = internal.server_address[1]
-
-    class RedirectHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.2:{internal_port}/")
-            self.end_headers()
-
-        def log_message(self, *args):
-            pass
-
-    public = _start_server("127.0.0.1", RedirectHandler)
-    url = f"http://127.0.0.1:{public.server_address[1]}/"
-
-    check_ssrf_url(url)  # passes: 127.0.0.1 is "global" under this fixture
-    response = requests.get(url, stream=True, timeout=5)  # old code's actual fetch call
-    assert response.raw.read() == b"SECRET_INTERNAL_DATA"
-    assert InternalHandler.hit_count == 1
-
-    internal.shutdown()
-    public.shutdown()
-
-
-def test_fetch_safe_url_blocks_redirect_to_private_ip(pretend_loopback_is_global):
-    r"""fetch_safe_url() must re-validate (and refuse to follow) a redirect into a private IP."""
-    _CountingHandler.hit_count = 0
-
-    class InternalHandler(_CountingHandler):
-        response_body = b"SECRET_INTERNAL_DATA"
-
-    internal = _start_server("127.0.0.2", InternalHandler)
-    internal_port = internal.server_address[1]
-
-    class RedirectHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.2:{internal_port}/")
-            self.end_headers()
-
-        def log_message(self, *args):
-            pass
-
-    public = _start_server("127.0.0.1", RedirectHandler)
-    url = f"http://127.0.0.1:{public.server_address[1]}/"
+    handler_cls = _redirect_handler(PRIVATE_TARGET)
+    handler_cls.hit_count = 0
+    public = start_server(handler_cls)
 
     with pytest.raises(HTTPException) as exc_info:
-        fetch_safe_url(url)
+        fetch_safe_url(f"http://127.0.0.1:{public.server_address[1]}/")
 
     assert exc_info.value.status_code == 403
-    assert InternalHandler.hit_count == 0  # the internal server must never be reached
-
-    internal.shutdown()
-    public.shutdown()
+    assert handler_cls.hit_count == 1  # stopped at the first hop, never followed the Location
 
 
-def test_fetch_safe_url_follows_redirect_to_another_public_ip(pretend_loopback_is_global):
+def test_fetch_safe_url_follows_redirect_to_another_public_ip(start_server, pretend_loopback_is_global):
     r"""A redirect to a URL that also passes the SSRF check must still be followed."""
-    _CountingHandler.hit_count = 0
 
     class TargetHandler(_CountingHandler):
         response_body = b"FINAL_DESTINATION"
+        hit_count = 0
 
-    target = _start_server("127.0.0.1", TargetHandler)
-    target_port = target.server_address[1]
+    target = start_server(TargetHandler)
+    redirector = start_server(_redirect_handler(f"http://127.0.0.1:{target.server_address[1]}/final"))
 
-    class RedirectHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.1:{target_port}/final")
-            self.end_headers()
+    response = fetch_safe_url(f"http://127.0.0.1:{redirector.server_address[1]}/")
 
-        def log_message(self, *args):
-            pass
-
-    # A second server on the same (pretend-global) loopback address handles the redirect hop.
-    redirector = _start_server("127.0.0.1", RedirectHandler)
-    url = f"http://127.0.0.1:{redirector.server_address[1]}/"
-
-    response = fetch_safe_url(url)
     assert response.content == b"FINAL_DESTINATION"
     assert TargetHandler.hit_count == 1
 
-    target.shutdown()
-    redirector.shutdown()
+
+def test_fetch_safe_url_refuses_a_redirect_chain_that_never_ends(start_server, pretend_loopback_is_global):
+    r"""A server that redirects to itself forever must be cut off, not followed indefinitely."""
+    handler_cls = _redirect_handler("/loop")  # relative: urljoin keeps pointing back at this server
+    handler_cls.hit_count = 0
+    server = start_server(handler_cls)
+
+    with pytest.raises(HTTPException) as exc_info:
+        fetch_safe_url(f"http://127.0.0.1:{server.server_address[1]}/")
+
+    assert exc_info.value.status_code == 400
+    assert "redirect" in exc_info.value.detail.lower()
+    assert handler_cls.hit_count == MAX_SAFE_REDIRECTS + 1
 
 
-def test_naive_request_without_pinning_is_vulnerable_to_dns_rebinding(monkeypatch, pretend_loopback_is_global):
-    r"""Demonstrates the DNS-rebinding half of #10646.
+def test_fetch_safe_url_pins_connection_against_dns_rebinding(monkeypatch, start_server, pretend_loopback_is_global):
+    r"""fetch_safe_url() must connect to what it validated, immune to a second/different DNS answer.
 
-    A plain `socket.getaddrinfo`-based check followed by a *separate* connection attempt can
-    resolve a hostname twice: once for the SSRF check, and again when the HTTP client actually
-    connects. A malicious/compromised DNS server can answer differently the second time (the
-    "rebind"), pointing the real connection at a private address after the check already passed.
+    A hostname is resolved twice by the old pattern: once for the SSRF check, and again when the
+    HTTP client connects. A malicious DNS server can answer differently the second time -- the
+    "rebind" -- pointing the real connection somewhere the check never saw.
+
+    The rebound answer here differs by port rather than by address. `socket.create_connection`
+    connects to the whole sockaddr that `getaddrinfo` returns, port included, so this exercises
+    exactly the same "the client re-resolved and got a different answer" path, while keeping every
+    server on 127.0.0.1 so the test runs on macOS too.
     """
-    _CountingHandler.hit_count = 0
-
-    class PrivateHandler(_CountingHandler):
-        response_body = b"SECRET_INTERNAL_DATA"
-
-    private = _start_server("127.0.0.2", PrivateHandler)
-    port = private.server_address[1]
-    public = _start_server("127.0.0.1", _CountingHandler, port=port)
-
-    real_getaddrinfo = socket.getaddrinfo
-    calls = {"n": 0}
-
-    def rebinding_getaddrinfo(host, *args, **kwargs):
-        if host == "rebind.example.test":
-            calls["n"] += 1
-            # 1st resolution (the SSRF check) answers with the "public" address; every
-            # subsequent resolution (i.e. what the HTTP client does when it connects) answers
-            # with the private one.
-            target = "127.0.0.1" if calls["n"] == 1 else "127.0.0.2"
-            return real_getaddrinfo(target, *args, **kwargs)
-        return real_getaddrinfo(host, *args, **kwargs)
-
-    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
-
-    url = f"http://rebind.example.test:{port}/"
-    check_ssrf_url(url)  # 1st resolution: passes, resolves to the "public" 127.0.0.1
-    response = requests.get(url, timeout=5)  # 2nd resolution happens here: rebinds to 127.0.0.2
-    assert response.content == b"SECRET_INTERNAL_DATA"
-    assert PrivateHandler.hit_count == 1
-
-    private.shutdown()
-    public.shutdown()
-
-
-def test_fetch_safe_url_pins_connection_against_dns_rebinding(monkeypatch, pretend_loopback_is_global):
-    r"""fetch_safe_url() must connect to the IP it validated, immune to a second/different DNS answer."""
-    _CountingHandler.hit_count = 0
 
     class SafeHandler(_CountingHandler):
         response_body = b"SAFE_DATA"
+        hit_count = 0
 
     class PrivateHandler(_CountingHandler):
         response_body = b"SECRET_INTERNAL_DATA"
+        hit_count = 0
 
-    private = _start_server("127.0.0.2", PrivateHandler)
-    port = private.server_address[1]
-    safe = _start_server("127.0.0.1", SafeHandler, port=port)
+    safe_port = start_server(SafeHandler).server_address[1]
+    private_port = start_server(PrivateHandler).server_address[1]
 
     real_getaddrinfo = socket.getaddrinfo
     calls = {"n": 0}
 
-    def rebinding_getaddrinfo(host, *args, **kwargs):
+    def rebinding_getaddrinfo(host, port, *args, **kwargs):
         if host == "rebind.example.test":
             calls["n"] += 1
-            target = "127.0.0.1" if calls["n"] == 1 else "127.0.0.2"
-            return real_getaddrinfo(target, *args, **kwargs)
-        return real_getaddrinfo(host, *args, **kwargs)
+            # 1st resolution (the SSRF check) answers with the checked target; every subsequent
+            # resolution -- i.e. what the HTTP client would do when it connects -- rebinds.
+            port = safe_port if calls["n"] == 1 else private_port
+            return real_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+
+        return real_getaddrinfo(host, port, *args, **kwargs)
 
     monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
 
-    url = f"http://rebind.example.test:{port}/"
-    response = fetch_safe_url(url)
+    response = fetch_safe_url(f"http://rebind.example.test:{safe_port}/")
 
     assert response.content == b"SAFE_DATA"
-    assert PrivateHandler.hit_count == 0  # the connection must never reach the rebound address
-
-    private.shutdown()
-    safe.shutdown()
+    assert PrivateHandler.hit_count == 0  # the connection must never reach the rebound target

@@ -16,7 +16,6 @@ import ipaddress
 import json
 import os
 import socket
-import threading
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlparse
 
@@ -30,6 +29,8 @@ if is_fastapi_available():
 
 if is_requests_available():
     import requests
+    import urllib3
+    from requests.adapters import HTTPAdapter
 
 
 if TYPE_CHECKING:
@@ -44,22 +45,6 @@ ALLOW_LOCAL_FILES = is_env_enabled("ALLOW_LOCAL_FILES", "1")
 # target is re-validated by check_ssrf_url before being followed, so this only bounds how many
 # times we are willing to re-validate before giving up.
 MAX_SAFE_REDIRECTS = 5
-
-# check_ssrf_url() resolves a hostname to a single, validated IP address, and the actual HTTP
-# connection is then pinned to that exact IP (see _PinDnsResolution below) so that the
-# underlying HTTP client can never resolve the hostname a second time to a different (private)
-# address -- the classic DNS-rebinding TOCTOU. Pinning is implemented as a temporary, process-wide
-# monkeypatch of socket.getaddrinfo, so every fetch_safe_url() call must hold this lock while its
-# patch is active, trading fetch concurrency for correctness: this MUST stay a single global lock,
-# not e.g. striped per-hostname, because the patch target (socket.getaddrinfo) is one process-wide
-# attribute -- two concurrent fetches of *different* hosts would each monkeypatch and restore it
-# independently, racing to clobber each other's pin mid-request. A lock-free, fully concurrent
-# version is possible (pin the IP at the urllib3 connection level via a custom `HTTPConnection`
-# subclass overriding `_new_conn`, leaving `.host`/SNI untouched, instead of monkeypatching DNS
-# resolution), but needs care wiring through requests' HTTPAdapter/PoolManager (proxies, TLS
-# verification, HTTP vs HTTPS) to avoid regressing the SSRF guarantee itself; left as a follow-up
-# rather than risking that rewrite unreviewed in a security fix.
-_dns_pin_lock = threading.Lock()
 
 
 def dictify(data: "BaseModel") -> dict[str, Any]:
@@ -99,7 +84,7 @@ def check_ssrf_url(url: str) -> str:
 
     Returns:
         The IP address that the URL's hostname resolved to. Callers that go on to fetch the URL
-        MUST connect to this exact IP address (e.g. via `_PinDnsResolution`) instead of letting
+        MUST connect to this exact IP address (e.g. via `_PinnedIPAdapter`) instead of letting
         the HTTP client resolve the hostname again, otherwise a second DNS lookup could return a
         different, private address (DNS rebinding) and bypass this check entirely.
     """
@@ -115,8 +100,13 @@ def check_ssrf_url(url: str) -> str:
     if not hostname:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid URL hostname.")
 
+    try:  # .port raises for an out-of-range port, e.g. http://example.com:99999/
+        port = parsed_url.port
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid URL port: {e}")
+
     try:
-        ip_info = socket.getaddrinfo(hostname, parsed_url.port)
+        ip_info = socket.getaddrinfo(hostname, port)
     except socket.gaierror:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not resolve hostname: {hostname}")
 
@@ -141,35 +131,86 @@ def check_ssrf_url(url: str) -> str:
     return resolved_ip
 
 
-class _PinDnsResolution:
-    """Temporarily forces `socket.getaddrinfo(hostname, ...)` to resolve to a single, pre-validated IP.
+class _PinnedIPConnectionMixin:
+    """Connects to a pre-validated IP address instead of re-resolving the hostname.
 
-    This closes the DNS-rebinding TOCTOU window between `check_ssrf_url` validating a hostname and
-    the HTTP client actually connecting to it: while this is active, resolving `hostname` cannot
-    return anything other than the address that was already checked, no matter what a (potentially
-    attacker-controlled) DNS server would answer on a second query. The patch is process-wide, so
-    callers must hold `_dns_pin_lock` while it is in effect.
+    urllib3 opens the socket against `_dns_host` but keeps using `.host` for the Host header, SNI
+    and certificate validation, so swapping only the former for the duration of the connect pins
+    the connection to the address `check_ssrf_url` already validated while leaving the request
+    otherwise untouched. This closes the DNS-rebinding TOCTOU window between the check and the
+    connection: a second lookup cannot point the socket somewhere private, because there is no
+    second lookup.
+
+    The pin lives on the connection object, so unlike a `socket.getaddrinfo` monkeypatch it is
+    invisible to concurrent fetches and to every other thread in the process, and needs no lock.
     """
 
-    def __init__(self, hostname: str, ip: str) -> None:
-        self._hostname = hostname
-        self._ip = ip
-        self._original_getaddrinfo = None
+    def __init__(self, *args: Any, pinned_ip: str | None = None, **kwargs: Any) -> None:
+        self.pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
 
-    def __enter__(self) -> "_PinDnsResolution":
-        self._original_getaddrinfo = socket.getaddrinfo
+    def _new_conn(self) -> "socket.socket":
+        if not self.pinned_ip:
+            return super()._new_conn()
 
-        def _pinned_getaddrinfo(host, *args, **kwargs):
-            if host == self._hostname:
-                host = self._ip
+        dns_host, self._dns_host = self._dns_host, self.pinned_ip
+        try:
+            return super()._new_conn()
+        finally:
+            self._dns_host = dns_host
 
-            return self._original_getaddrinfo(host, *args, **kwargs)
 
-        socket.getaddrinfo = _pinned_getaddrinfo
-        return self
+class _PinnedIPHTTPConnection(_PinnedIPConnectionMixin, urllib3.connection.HTTPConnection):
+    pass
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        socket.getaddrinfo = self._original_getaddrinfo
+
+class _PinnedIPHTTPSConnection(_PinnedIPConnectionMixin, urllib3.connection.HTTPSConnection):
+    pass
+
+
+class _PinnedIPHTTPConnectionPool(urllib3.connectionpool.HTTPConnectionPool):
+    ConnectionCls = _PinnedIPHTTPConnection
+
+
+class _PinnedIPHTTPSConnectionPool(urllib3.connectionpool.HTTPSConnectionPool):
+    ConnectionCls = _PinnedIPHTTPSConnection
+
+
+class _PinnedIPPoolManager(urllib3.PoolManager):
+    """A pool manager whose connections all target `pinned_ip`."""
+
+    def __init__(self, pinned_ip: str, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pinned_ip = pinned_ip
+        self.pool_classes_by_scheme = {
+            "http": _PinnedIPHTTPConnectionPool,
+            "https": _PinnedIPHTTPSConnectionPool,
+        }
+
+    def _new_pool(self, scheme: str, host: str, port: int, request_context=None):
+        pool = super()._new_pool(scheme, host, port, request_context)
+        # injected after construction rather than passed through connection_pool_kw, whose keys
+        # must all be fields of urllib3's PoolKey
+        pool.conn_kw["pinned_ip"] = self._pinned_ip
+        return pool
+
+
+class _PinnedIPAdapter(HTTPAdapter):
+    """A requests adapter that connects to `pinned_ip` for every host it serves.
+
+    A configured HTTP proxy is out of scope: requests routes proxied requests through a separate
+    ProxyManager, and the proxy resolves the hostname itself, so the pin (like any client-side
+    SSRF check) cannot constrain where the connection ends up.
+    """
+
+    def __init__(self, pinned_ip: str, **kwargs: Any) -> None:
+        self._pinned_ip = pinned_ip
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections: int, maxsize: int, block: bool = False, **pool_kwargs: Any) -> None:
+        self.poolmanager = _PinnedIPPoolManager(
+            self._pinned_ip, num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
+        )
 
 
 def fetch_safe_url(url: str, **kwargs) -> "Response":
@@ -177,7 +218,7 @@ def fetch_safe_url(url: str, **kwargs) -> "Response":
 
     The hostname of `url`, and of every redirect hop encountered while following it, is validated
     with `check_ssrf_url` and the connection is pinned to the exact IP address that was just
-    validated (see `_PinDnsResolution`). Redirects are therefore never auto-followed by the
+    validated (see `_PinnedIPAdapter`). Redirects are therefore never auto-followed by the
     underlying HTTP client: each `Location` is re-validated from scratch, up to `MAX_SAFE_REDIRECTS`
     hops, before it is followed.
     """
@@ -187,11 +228,15 @@ def fetch_safe_url(url: str, **kwargs) -> "Response":
 
     current_url = url
     for _ in range(MAX_SAFE_REDIRECTS + 1):
-        parsed_url = urlparse(current_url)
         ip = check_ssrf_url(current_url)
 
-        with _dns_pin_lock, _PinDnsResolution(parsed_url.hostname, ip):
-            response = requests.get(current_url, **kwargs)
+        # mirrors requests' own top-level API: the session is closed once the response is built,
+        # which leaves an already-checked-out streaming connection usable.
+        with requests.Session() as session:
+            adapter = _PinnedIPAdapter(ip)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            response = session.get(current_url, **kwargs)
 
         if response.status_code in (301, 302, 303, 307, 308):
             location = response.headers.get("Location")
