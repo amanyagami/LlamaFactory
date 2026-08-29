@@ -65,3 +65,64 @@ def test_get_save_dir_still_bypasses_for_absolute_custom_path(monkeypatch):
     monkeypatch.setattr(webui_common, "DEFAULT_SAVE_DIR", "saves")
     absolute_path = os.path.abspath(os.path.join(os.sep, "abs", "custom", "path"))
     assert webui_common.get_save_dir("mymodel", "lora", absolute_path) == absolute_path
+
+
+def test_list_checkpoints_sorts_by_step_number(tmp_path, monkeypatch):
+    r"""checkpoint-200 must come before checkpoint-1000, which a lexicographic sort gets wrong."""
+    monkeypatch.setattr(webui_common, "DEFAULT_SAVE_DIR", str(tmp_path))
+
+    run_dir = tmp_path / "mymodel" / "lora" / "train_run"
+    for step in (100, 200, 1000):
+        (run_dir / f"checkpoint-{step}").mkdir(parents=True)
+        (run_dir / f"checkpoint-{step}" / "adapter_model.safetensors").touch()
+
+    result = list_checkpoints("mymodel", "lora")
+    assert [value for _, value in result.choices] == [
+        os.path.join("train_run", "checkpoint-100"),
+        os.path.join("train_run", "checkpoint-200"),
+        os.path.join("train_run", "checkpoint-1000"),
+    ]
+
+
+def test_list_checkpoints_skips_the_save_dir_itself(tmp_path, monkeypatch):
+    r"""A checkpoint sitting in the save dir itself must not surface as a "." dropdown entry."""
+    monkeypatch.setattr(webui_common, "DEFAULT_SAVE_DIR", str(tmp_path))
+
+    save_dir = tmp_path / "mymodel" / "lora"
+    save_dir.mkdir(parents=True)
+    (save_dir / "adapter_model.safetensors").touch()
+
+    result = list_checkpoints("mymodel", "lora")
+    assert [value for _, value in result.choices] == []
+
+
+def test_list_checkpoints_ignores_unrelated_dirs(tmp_path, monkeypatch):
+    r"""Logging and export dirs under the save dir hold no checkpoint files and must not be listed."""
+    monkeypatch.setattr(webui_common, "DEFAULT_SAVE_DIR", str(tmp_path))
+
+    save_dir = tmp_path / "mymodel" / "lora"
+    (save_dir / "runs" / "Jan01_00-00-00").mkdir(parents=True)
+    (save_dir / "runs" / "Jan01_00-00-00" / "events.out.tfevents.1").touch()
+    (save_dir / "wandb" / "latest-run").mkdir(parents=True)
+    (save_dir / "train_run").mkdir(parents=True)
+    (save_dir / "train_run" / "adapter_model.safetensors").touch()
+
+    result = list_checkpoints("mymodel", "lora")
+    assert [value for _, value in result.choices] == ["train_run"]
+
+
+def test_list_checkpoints_lists_intermediate_saves_of_a_finished_run(tmp_path, monkeypatch):
+    r"""A finished run keeps its intermediate checkpoints selectable alongside its final save."""
+    monkeypatch.setattr(webui_common, "DEFAULT_SAVE_DIR", str(tmp_path))
+
+    run_dir = tmp_path / "mymodel" / "lora" / "train_run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "adapter_model.safetensors").touch()
+    (run_dir / "checkpoint-100").mkdir()
+    (run_dir / "checkpoint-100" / "adapter_model.safetensors").touch()
+
+    result = list_checkpoints("mymodel", "lora")
+    assert [value for _, value in result.choices] == [
+        "train_run",
+        os.path.join("train_run", "checkpoint-100"),
+    ]
