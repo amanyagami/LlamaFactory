@@ -141,7 +141,8 @@ def load_dataset_info(dataset_dir: str) -> dict[str, dict[str, Any]]:
     r"""Load dataset_info.json.
 
     Raises:
-        ValueError: if dataset_info.json exists but contains invalid JSON or invalid dataset entries.
+        ValueError: if dataset_info.json exists but cannot be decoded, contains invalid JSON,
+            or contains invalid dataset entries. The caller is expected to report it to the user.
     """
     if dataset_dir == "ONLINE" or dataset_dir.startswith("REMOTE:"):
         logger.info_rank0(f"dataset_dir is {dataset_dir}, using online dataset.")
@@ -154,13 +155,13 @@ def load_dataset_info(dataset_dir: str) -> dict[str, dict[str, Any]]:
     except OSError as err:
         logger.warning_rank0(f"Cannot open {dataset_info_path} due to {str(err)}.")
         return {}
-    except json.JSONDecodeError as err:
-        logger.warning_rank0(f"Cannot open {dataset_info_path} due to {str(err)}.")
-        raise ValueError(f"Failed to parse {DATA_CONFIG}: {err}") from err
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        # UnicodeDecodeError comes from the read inside open(), not from json; it subclasses ValueError,
+        # so it would reach the caller either way, but naming it here makes the contract explicit.
+        raise ValueError(f"Failed to parse {dataset_info_path}: {err}") from err
 
     if not isinstance(dataset_info, dict) or not all(isinstance(value, dict) for value in dataset_info.values()):
-        logger.warning_rank0(f"Invalid dataset entries found in {dataset_info_path}.")
-        raise ValueError(f"Invalid dataset entries found in {DATA_CONFIG}, each dataset must be a JSON object.")
+        raise ValueError(f"Invalid dataset entries found in {dataset_info_path}, each dataset must be a JSON object.")
 
     return dataset_info
 

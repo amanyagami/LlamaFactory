@@ -48,3 +48,10 @@ def test_load_dataset_info_non_dict_root_raises(tmp_path):
     (tmp_path / "dataset_info.json").write_text(json.dumps(["alpaca"]), encoding="utf-8")
     with pytest.raises(ValueError):
         load_dataset_info(str(tmp_path))
+
+
+def test_load_dataset_info_non_utf8_raises(tmp_path):
+    r"""A dataset_info.json that is not valid UTF-8 must raise, not fall through as a silent empty dict."""
+    (tmp_path / "dataset_info.json").write_bytes(b'{"alpaca": {"file_name": "\xff\xfe.json"}}')
+    with pytest.raises(ValueError):
+        load_dataset_info(str(tmp_path))
